@@ -1,220 +1,192 @@
 #!/usr/bin/env python3
 """
-Custom ReAct Agent that parses text-based actions.
-Works with any LLM that can follow the ReAct format.
+Custom ReAct Agent using MCP tools (File + Terminal)
 """
 
 import re
 import json
-from typing import Dict, Any, List, Tuple
+from typing import List, Tuple, Any
 from langchain_core.tools import tool
+
 from app.llm import get_llm
 from app.mcp import MCPManager
 
-# Global MCP manager singleton
+# ----------------------------
+# MCP Manager (Singleton)
+# ----------------------------
 _mcp_manager = None
 
 
 def get_mcp_manager() -> MCPManager:
-    """Initialize and return MCP manager with tools registered."""
     global _mcp_manager
     if _mcp_manager is None:
         _mcp_manager = MCPManager()
+
         from app.tools.file_tool import FileTool
         from app.tools.terminal_tool import TerminalTool
+
         _mcp_manager.register_tool(FileTool())
         _mcp_manager.register_tool(TerminalTool())
+
     return _mcp_manager
 
 
+# ----------------------------
+# Tools (wrapped via MCP)
+# ----------------------------
 @tool
 def file_reader(path: str) -> str:
-    """
-    Read contents of a file from disk.
-
-    Args:
-        path: File path to read (relative or absolute)
-
-    Returns:
-        File content as string, or error message
-    """
+    """Read file content from disk"""
     mcp = get_mcp_manager()
     result = mcp.execute("FileReader", {"path": path})
 
     if result["status"] == "success":
         return str(result["result"])
-    else:
-        return f"Error: {result['error']}"
+    return f"Error: {result['error']}"
 
 
 @tool
 def terminal(command: str) -> str:
-    """
-    Execute a shell command and return output.
-
-    Args:
-        command: Shell command to execute (e.g., 'ls -la', 'pwd')
-
-    Returns:
-        Command output as string, or error message
-    """
+    """Execute terminal command"""
     mcp = get_mcp_manager()
     result = mcp.execute("Terminal", {"command": command})
 
     if result["status"] == "success":
         return str(result["result"])
-    else:
-        return f"Error: {result['error']}"
+    return f"Error: {result['error']}"
 
 
+# ----------------------------
+# ReAct Agent
+# ----------------------------
 class ReactAgent:
-    """ReAct agent that uses text-based reasoning and tool use."""
-
-    def __init__(self, llm, tools: List, max_iterations: int = 10):
+    def __init__(self, llm, tools: List, max_iterations: int = 8):
         self.llm = llm
         self.tools = {tool.name: tool for tool in tools}
         self.max_iterations = max_iterations
 
     def run(self, query: str) -> str:
-        """
-        Run the agent on a user query.
-
-        Args:
-            query: User's question/command
-
-        Returns:
-            Agent's final answer
-        """
-        system_prompt = self._build_system_prompt()
-
-        # Start conversation
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": query}
         ]
 
-        for step in range(self.max_iterations):
+        for _ in range(self.max_iterations):
+            response = self.llm.invoke(messages)
+            content = response.content
+            messages.append({"role": "assistant", "content": content})
+
+            # ✅ Final answer
+            if "Final Answer:" in content:
+                return content.split("Final Answer:")[-1].strip()
+
+            # 🔍 Parse action
+            action, action_input = self._parse_action(content)
+
+            if not action:
+                messages.append({
+                    "role": "user",
+                    "content": "Observation: Invalid format. Use Action + JSON input."
+                })
+                continue
+
+            if action not in self.tools:
+                messages.append({
+                    "role": "user",
+                    "content": f"Observation: Tool not found. Available: {list(self.tools.keys())}"
+                })
+                continue
+
+            # ⚙️ Execute tool
             try:
-                # Get LLM response
-                response = self.llm.invoke(messages)
-                content = response.content
-                messages.append({"role": "assistant", "content": content})
-
-                # Check for final answer
-                if "Final Answer:" in content:
-                    final = content.split("Final Answer:")[-1].strip()
-                    return final
-
-                # Parse Action and Action Input
-                action, action_input = self._parse_action(content)
-                if not action:
-                    # Provide feedback and let it try again
-                    observation = "Error: Could not detect Action/Action Input. Use format:\nAction: <tool>\nAction Input: <JSON>"
-                    messages.append({"role": "user", "content": f"Observation: {observation}"})
-                    continue
-
-                # Validate tool
-                if action not in self.tools:
-                    observation = f"Error: Tool '{action}' not found. Available: {list(self.tools.keys())}"
-                    messages.append({"role": "user", "content": f"Observation: {observation}"})
-                    continue
-
-                # Execute tool
-                try:
-                    tool = self.tools[action]
-                    # StructuredTool uses invoke
-                    result = tool.invoke(action_input)
-                    observation = str(result)
-                except Exception as e:
-                    observation = f"Error executing tool: {str(e)}"
-
-                messages.append({"role": "user", "content": f"Observation: {observation}"})
-
+                result = self.tools[action].invoke(action_input)
+                observation = str(result)
             except Exception as e:
-                return f"Agent error: {str(e)}"
+                observation = f"Error: {str(e)}"
 
-        return "Max iterations reached without final answer."
+            messages.append({
+                "role": "user",
+                "content": f"Observation: {observation}"
+            })
 
-    def _build_system_prompt(self) -> str:
-        """Build system prompt with tool descriptions and ReAct instructions."""
-        tools_desc = []
-        for name, tool in self.tools.items():
-            desc = getattr(tool, "description", "No description")
-            # Get parameter info from tool's args schema if available
-            # For simplicity, we just state the tool name and description
-            tools_desc.append(f"- {name}: {desc}")
-        tools_text = "\n".join(tools_desc)
+        return "Max iterations reached."
 
-        return f"""You are an autonomous AI agent that uses tools to answer questions.
+    # ----------------------------
+    # Prompt
+    # ----------------------------
+    def _system_prompt(self) -> str:
+        tool_desc = "\n".join([
+            f"- {name}: {tool.description}"
+            for name, tool in self.tools.items()
+        ])
 
-Available tools:
-{tools_text}
+        return f"""
+You are an AI agent that uses tools.
 
-INSTRUCTIONS:
-- Think step by step. Start with "Thought:".
-- To use a tool, output exactly:
-  Action: <tool name>
-  Action Input: <JSON with arguments>
-- After you receive "Observation:", think and decide next action.
-- When you have the final answer, output:
-  Thought: <final reasoning>
-  Final Answer: <your answer>
+TOOLS:
+{tool_desc}
 
-EXAMPLE:
+RULES:
+- Think step by step
+- Use EXACT format:
+
+Thought: ...
+Action: <tool name>
+Action Input: {{ JSON }}
+
+- After Observation → think again
+- Final output:
+
+Final Answer: ...
+
+Example:
 User: list files
-Thought: I need to see the files, so I'll use the terminal tool.
+Thought: I should use terminal
 Action: Terminal
 Action Input: {{"command": "ls"}}
-Observation: file1.txt  file2.txt
-Thought: Now I have the list, I can answer.
-Final Answer: The files are: file1.txt, file2.txt
+Observation: file1.py
+Thought: Done
+Final Answer: file1.py
+"""
 
-Begin!"""
-
+    # ----------------------------
+    # Parser
+    # ----------------------------
     def _parse_action(self, text: str) -> Tuple[Any, Any]:
-        """
-        Parse the LLM output to extract action and action_input.
-        Returns (action, action_input) or (None, None).
-        """
-        # Find "Action:" line
-        action_match = re.search(r'Action:\s*([^\n]+)', text, re.IGNORECASE)
+        action_match = re.search(r'Action:\s*(.+)', text)
         if not action_match:
             return None, None
 
         action = action_match.group(1).strip()
 
-        # Find "Action Input:" after the action
-        start = action_match.end()
-        rest = text[start:]
-        # Match a JSON object (may be single line or multiline)
-        input_match = re.search(r'Action Input:\s*(\{.*?\})(?=\n\w+:|$)', rest, re.DOTALL | re.IGNORECASE)
+        input_match = re.search(
+            r'Action Input:\s*(\{.*?\})',
+            text,
+            re.DOTALL
+        )
+
         if not input_match:
-            # Try single-line without braces? Not used
             return None, None
 
-        input_str = input_match.group(1).strip()
         try:
-            action_input = json.loads(input_str)
-            return action, action_input
-        except json.JSONDecodeError:
+            data = json.loads(input_match.group(1))
+            return action, data
+        except:
             return None, None
 
 
-def create_agent() -> ReactAgent:
-    """
-    Create and return the ReAct agent.
-
-    Returns:
-        ReactAgent instance with tools registered
-    """
+# ----------------------------
+# Factory
+# ----------------------------
+def create_agent():
     llm = get_llm()
     tools = [file_reader, terminal]
-    return ReactAgent(llm, tools, max_iterations=10)
+    return ReactAgent(llm, tools)
 
 
-# For testing
+# ----------------------------
+# Test
+# ----------------------------
 if __name__ == "__main__":
     agent = create_agent()
-    print("Agent created. Testing simple query...")
-    result = agent.run("list files in current directory")
-    print("Result:", result)
+    print(agent.run("list files"))
